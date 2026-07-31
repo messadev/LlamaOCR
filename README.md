@@ -39,7 +39,7 @@ During my career as an accountant, I spent countless hours manually processing i
 ### Prerequisites
 - Python 3.8 or higher
 - [Streamlit](https://streamlit.io/)
-- An active API key for the [Llama3.2 Vision Model] from Groq(https://console.groq.com/docs/overview)
+- [Ollama](https://ollama.com/) installed and running locally, with a vision-capable model pulled (e.g. `ollama pull llama3.2-vision`)
 
 ### Installation Steps
 1. **Clone the Repository**:
@@ -53,10 +53,15 @@ During my career as an accountant, I spent countless hours manually processing i
    pip install -r requirements.txt
    ```
 
-3. **Set Up API Key**:
-   Create a `.env` file in the root directory and add your GROQ API key:
+3. **Pull the Local Model**:
+   With Ollama installed and running, pull the vision model used for OCR:
+   ```bash
+   ollama pull llama3.2-vision
+   ```
+   Optionally, set these in a `.env` file to override the defaults:
    ```env
-   GROQ_API_KEY=your_api_key_here
+   OLLAMA_BASE_URL=http://localhost:11434
+   OLLAMA_VISION_MODEL=llama3.2-vision
    ```
 
 4. **Run the Application**:

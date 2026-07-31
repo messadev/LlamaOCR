@@ -2,13 +2,14 @@ import os
 import streamlit as st
 from dotenv import load_dotenv
 from PIL import Image
-from langchain_groq import ChatGroq
+from langchain_ollama import ChatOllama
 import base64
 import io
 from time import sleep
 
 load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llama3.2-vision")
 
 def encode_image_pil(image: Image.Image) -> str:
     buffered = io.BytesIO()
@@ -29,10 +30,10 @@ def split_image_into_horizontal_stripes(image: Image.Image, stripe_count: int = 
         stripes.append(stripe)
     return stripes
 
-def ocr(image: Image.Image, model: str = "llama-3.2-90b-vision-preview") -> str:
-    groq_llm = ChatGroq(
-        groq_api_key=GROQ_API_KEY,
-        model_name=model,
+def ocr(image: Image.Image, model: str = OLLAMA_VISION_MODEL) -> str:
+    ollama_llm = ChatOllama(
+        base_url=OLLAMA_BASE_URL,
+        model=model,
         temperature=0
     )
 
@@ -51,13 +52,13 @@ def ocr(image: Image.Image, model: str = "llama-3.2-90b-vision-preview") -> str:
         }
     ]
 
-    response = groq_llm.invoke(messages)
+    response = ollama_llm.invoke(messages)
     return response.content.strip()
 
-def format_to_table(markdown_runs: list, model: str = "llama-3.3-70b-versatile") -> str:
-    groq_llm = ChatGroq(
-        groq_api_key=GROQ_API_KEY,
-        model_name=model,
+def format_to_table(markdown_runs: list, model: str = OLLAMA_VISION_MODEL) -> str:
+    ollama_llm = ChatOllama(
+        base_url=OLLAMA_BASE_URL,
+        model=model,
         temperature=0
     )
 
@@ -81,7 +82,7 @@ def format_to_table(markdown_runs: list, model: str = "llama-3.3-70b-versatile")
         }
     ]
 
-    response = groq_llm.invoke(messages)
+    response = ollama_llm.invoke(messages)
     return response.content.strip()
 
 # Streamlit Application
@@ -126,14 +127,14 @@ if uploaded_file is not None:
             status_box.markdown(f"**Processing Stripe {i}, Run {run} ({int(progress * 100)}%)...**")
             sleep(0.1)  # Simulating processing time
 
-            stripe_markdown = ocr(stripe, model="llama-3.2-90b-vision-preview")
+            stripe_markdown = ocr(stripe)
             markdown_runs.append(stripe_markdown)
 
     progress_bar.progress(1.0)
     status_box.markdown("**Processing complete.**")
 
     # Displaying Results
-    table_output = format_to_table(markdown_runs, model="llama-3.3-70b-versatile")
+    table_output = format_to_table(markdown_runs)
     st.markdown(table_output, unsafe_allow_html=True)
 
     # Download Button

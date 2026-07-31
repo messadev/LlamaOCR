@@ -1,7 +1,6 @@
-groq
 python-dotenv
 numpy
 streamlit
-langchain-groq
+langchain-ollama
 langchain_community
 pillow
