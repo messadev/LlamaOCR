@@ -1,6 +1,7 @@
 python-dotenv
 numpy
 streamlit
-langchain-ollama
-langchain_community
 pillow
+pandas
+pytesseract
+pymupdf

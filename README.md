@@ -39,7 +39,7 @@ During my career as an accountant, I spent countless hours manually processing i
 ### Prerequisites
 - Python 3.8 or higher
 - [Streamlit](https://streamlit.io/)
-- [Ollama](https://ollama.com/) installed and running locally, with a vision-capable model pulled (e.g. `ollama pull llama3.2-vision`)
+- [Ollama](https://ollama.com/) installed and running locally, with a vision-capable model pulled (e.g. `ollama pull qwen2.5vl:7b`)
 
 ### Installation Steps
 1. **Clone the Repository**:
@@ -56,12 +56,12 @@ During my career as an accountant, I spent countless hours manually processing i
 3. **Pull the Local Model**:
    With Ollama installed and running, pull the vision model used for OCR:
    ```bash
-   ollama pull llama3.2-vision
+   ollama pull qwen2.5vl:7b
    ```
    Optionally, set these in a `.env` file to override the defaults:
    ```env
    OLLAMA_BASE_URL=http://localhost:11434
-   OLLAMA_VISION_MODEL=llama3.2-vision
+   OLLAMA_VISION_MODEL=qwen2.5vl:7b
    ```
 
 4. **Run the Application**:

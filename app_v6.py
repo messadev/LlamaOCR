@@ -1,148 +1,120 @@
 import os
+from typing import List
+
+import fitz  # PyMuPDF
+import pandas as pd
+import pytesseract
 import streamlit as st
-from dotenv import load_dotenv
 from PIL import Image
-from langchain_ollama import ChatOllama
-import base64
-import io
-from time import sleep
+from pytesseract import Output
 
-load_dotenv()
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llama3.2-vision")
+# On Windows, pytesseract needs the Tesseract-OCR binary; point at the default
+# install location if it isn't already on PATH.
+_DEFAULT_TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if os.path.exists(_DEFAULT_TESSERACT_CMD):
+    pytesseract.pytesseract.tesseract_cmd = _DEFAULT_TESSERACT_CMD
 
-def encode_image_pil(image: Image.Image) -> str:
-    buffered = io.BytesIO()
-    image = image.convert("RGB")
-    image.save(buffered, format="JPEG", quality=85)
-    return base64.b64encode(buffered.getvalue()).decode("utf-8")
+PDF_RENDER_DPI = 300
+COLUMN_GAP_FACTOR = 2.5  # word gap > (median char width * factor) starts a new column
 
-def split_image_into_horizontal_stripes(image: Image.Image, stripe_count: int = 5, overlap: float = 0.1):
-    width, height = image.size
-    stripe_height = height // stripe_count
-    overlap_height = int(stripe_height * overlap)
 
-    stripes = []
-    for i in range(stripe_count):
-        upper = max(i * stripe_height - overlap_height, 0)
-        lower = min((i + 1) * stripe_height + overlap_height, height)
-        stripe = image.crop((0, upper, width, lower))
-        stripes.append(stripe)
-    return stripes
+def pdf_to_images(pdf_bytes: bytes, dpi: int = PDF_RENDER_DPI) -> List[Image.Image]:
+    images = []
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    zoom = dpi / 72
+    matrix = fitz.Matrix(zoom, zoom)
+    for page in doc:
+        pix = page.get_pixmap(matrix=matrix)
+        images.append(Image.frombytes("RGB", (pix.width, pix.height), pix.samples))
+    doc.close()
+    return images
 
-def ocr(image: Image.Image, model: str = OLLAMA_VISION_MODEL) -> str:
-    ollama_llm = ChatOllama(
-        base_url=OLLAMA_BASE_URL,
-        model=model,
-        temperature=0
-    )
 
-    image_data_url = f"data:image/jpeg;base64,{encode_image_pil(image)}"
+def image_to_rows(image: Image.Image) -> List[List[str]]:
+    """OCR one page image and reconstruct it as table rows (list of column strings)."""
+    data = pytesseract.image_to_data(image, output_type=Output.DATAFRAME)
+    data = data.dropna(subset=["text"])
+    data = data[data["text"].astype(str).str.strip() != ""]
+    if data.empty:
+        return []
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": (
-                    "The uploaded image contains both printed text and handwritten notes. "
-                    "Your task is to carefully extract all textual content, including handwritten elements."
-                )},
-                {"type": "image_url", "image_url": {"url": image_data_url}}
-            ]
-        }
-    ]
+    char_widths = data["width"] / data["text"].astype(str).str.len().clip(lower=1)
+    gap_threshold = (char_widths.median() or 10) * COLUMN_GAP_FACTOR
 
-    response = ollama_llm.invoke(messages)
-    return response.content.strip()
+    rows = []
+    for _, line_words in data.groupby(["block_num", "par_num", "line_num"], sort=False):
+        line_words = line_words.sort_values("left")
+        columns, current_words, prev_right = [], [], None
+        for _, word in line_words.iterrows():
+            left = word["left"]
+            if prev_right is not None and (left - prev_right) > gap_threshold:
+                columns.append(" ".join(current_words))
+                current_words = []
+            current_words.append(str(word["text"]))
+            prev_right = left + word["width"]
+        if current_words:
+            columns.append(" ".join(current_words))
+        rows.append(columns)
+    return rows
 
-def format_to_table(markdown_runs: list, model: str = OLLAMA_VISION_MODEL) -> str:
-    ollama_llm = ChatOllama(
-        base_url=OLLAMA_BASE_URL,
-        model=model,
-        temperature=0
-    )
 
-    combined_markdown = "\n\n".join(markdown_runs)
+def rows_to_dataframe(rows: List[List[str]]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    max_cols = max(len(r) for r in rows)
+    padded = [r + [""] * (max_cols - len(r)) for r in rows]
+    columns = [f"Column {i + 1}" for i in range(max_cols)]
+    return pd.DataFrame(padded, columns=columns)
 
-    messages = [
-        {
-            "role": "user",
-            "content": (
-                "You are provided with multiple markdown outputs extracted from overlapping sections of an image."
-                "Some sections may contain duplicate or conflicting information due to overlaps. "
-                "Your task is to:"
-                "\n\n1. Identify and consolidate rows of data that are related, ensuring that the most complete version of the information is retained."
-                "\n2. For rows with conflicting information (e.g., different values for a field), prioritize the more detailed entry."
-                "\n3. If a field is missing in one row but present in another, combine the information into a single row."
-                "\n4. Output the consolidated data in a clean tabular format using Markdown syntax, suitable for direct rendering."
-                "\n5. Output Only Markdown: Return solely the Markdown content without any additional explanations or comments."
-                "\n\nHere is the data to process:\n\n"
-                + combined_markdown
-            )
-        }
-    ]
-
-    response = ollama_llm.invoke(messages)
-    return response.content.strip()
 
 # Streamlit Application
-st.title("OCR to Tabular Data with Llama3.2 Vision Model")
-st.markdown("Convert uploaded image content into a structured table format.")
+st.title("Scanned PDF to Table (Local OCR)")
+st.markdown(
+    "Extracts text from scanned PDFs with Tesseract OCR and reconstructs rows/columns "
+    "from word positions. Runs on CPU only \u2014 no GPU or local vision model required."
+)
 
-# Sidebar for Upload and Display
 with st.sidebar:
-    st.markdown("#### Upload Image")
-    uploaded_file = st.file_uploader("Upload an image (JPEG, PNG)", type=["jpg", "jpeg", "png"])
-    if uploaded_file is not None:
-        image = Image.open(uploaded_file)
-        
-        # Resize image for better display
-        width, height = image.size
-        new_width, new_height = int(width * 1.2), int(height * 1.2)
-        image = image.resize((new_width, new_height))
-        
-        # Display the image in the sidebar
-        st.image(image, caption="Uploaded Image", use_container_width=True)
-        
-        # Preprocess the image
-        stripes = split_image_into_horizontal_stripes(image)
+    st.markdown("#### Upload Scanned PDFs")
+    uploaded_files = st.file_uploader(
+        "Upload one or more scanned PDF files", type=["pdf"], accept_multiple_files=True
+    )
+    dpi = st.number_input(
+        "Render DPI", min_value=100, max_value=600, value=PDF_RENDER_DPI, step=50,
+        help="Higher DPI improves OCR accuracy on small text but is slower.",
+    )
 
-# Main Section for Processing and Results
-if uploaded_file is not None:
-    st.markdown("#### OCR and Results")
-    progress_bar = st.progress(0)
-    n = 1
-    markdown_runs = []
-    total_steps = len(stripes) * n
-    step = 0
+if uploaded_files:
+    all_frames = []
+    for uploaded_file in uploaded_files:
+        st.markdown(f"#### {uploaded_file.name}")
+        pages = pdf_to_images(uploaded_file.read(), dpi=dpi)
 
-    # Dynamic status box
-    status_box = st.empty()
+        progress_bar = st.progress(0)
+        status_box = st.empty()
+        file_rows = []
+        for i, page_image in enumerate(pages, start=1):
+            status_box.markdown(f"**Processing page {i}/{len(pages)}...**")
+            file_rows.extend(image_to_rows(page_image))
+            progress_bar.progress(i / len(pages))
+        status_box.markdown("**Done.**")
 
-    for run in range(1, n + 1):
-        for i, stripe in enumerate(stripes, start=1):
-            step += 1
-            progress = step / total_steps
-            progress_bar.progress(progress)
-            status_box.markdown(f"**Processing Stripe {i}, Run {run} ({int(progress * 100)}%)...**")
-            sleep(0.1)  # Simulating processing time
+        df = rows_to_dataframe(file_rows)
+        if not df.empty:
+            df.insert(0, "Source File", uploaded_file.name)
+        all_frames.append(df)
+        st.dataframe(df, width="stretch")
 
-            stripe_markdown = ocr(stripe)
-            markdown_runs.append(stripe_markdown)
+    combined_df = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
 
-    progress_bar.progress(1.0)
-    status_box.markdown("**Processing complete.**")
+    st.markdown("#### Combined Results")
+    st.dataframe(combined_df, width="stretch")
 
-    # Displaying Results
-    table_output = format_to_table(markdown_runs)
-    st.markdown(table_output, unsafe_allow_html=True)
-
-    # Download Button
     st.download_button(
-        label="Download Table Output",
-        data=table_output.encode('utf-8'),
-        file_name="consensus_table.txt",
-        mime="text/plain"
+        label="Download Combined CSV",
+        data=combined_df.to_csv(index=False).encode("utf-8"),
+        file_name="extracted_data.csv",
+        mime="text/csv",
     )
 else:
-    st.markdown("Output will be displayed here after uploading an image.")
+    st.markdown("Output will be displayed here after uploading scanned PDF(s).")
