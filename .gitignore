@@ -162,3 +162,8 @@ cython_debug/
 #.idea/
 
 archive/
+
+# Local Tesseract language data (downloaded, not admin-writable into Program Files)
+tessdata/
+extracted_purchases.csv
+*.xlsx.*.bak
