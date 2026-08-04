@@ -165,5 +165,12 @@ archive/
 
 # Local Tesseract language data (downloaded, not admin-writable into Program Files)
 tessdata/
-extracted_purchases.csv
 *.xlsx.*.bak
+backup/
+
+# real business/invoice data — scanned documents, extracted spreadsheets/CSVs; never commit
+*.pdf
+*.jpg
+*.png
+*.xlsx
+*.csv
