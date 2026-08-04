@@ -6,6 +6,7 @@ import sys
 from typing import Dict, List, Optional
 
 import fitz  # PyMuPDF
+import numpy as np
 import pandas as pd
 import pytesseract
 from PIL import Image, ImageFilter, ImageOps
@@ -23,12 +24,13 @@ _OCR_CONFIG = f"{_TESSDATA_ARG} --psm 6"
 
 # "Единица измерения" is always a short Cyrillic abbreviation (шт, кг, л, компл...), never
 # mixed with Latin text. Requesting "rus+eng" for it (like the rest of the item table) invites
-# exactly the kind of Latin-lookalike misread this column suffers from ("шт" -> "WT"). OCR'ing
-# it separately with Cyrillic only, restricted to a Cyrillic-only character whitelist, removes
-# that ambiguity at the source instead of only patching known misreads after the fact.
+# exactly the kind of Latin-lookalike misread this column suffers from ("шт" -> "WT"/"LUT").
+# OCR'ing it separately with Cyrillic only removes that ambiguity at the source instead of
+# only patching known misreads after the fact. (A character whitelist would narrow this
+# further, but passing non-ASCII whitelist values through to the tesseract subprocess isn't
+# reliable on every Windows console codepage, so this relies on the language restriction alone.)
 _UNIT_COLUMN_LANG = "rus"
-_UNIT_CHAR_WHITELIST = "".join(chr(c) for c in range(0x0400, 0x0500)) + "."
-_UNIT_OCR_CONFIG = f"{_TESSDATA_ARG} --psm 6 -c tessedit_char_whitelist={_UNIT_CHAR_WHITELIST}"
+_ROW_NUMBER_CONFIG = f"{_TESSDATA_ARG} --psm 7"
 
 PDF_RENDER_DPI = 600
 MIN_OCR_WIDTH = 5000  # upscale images narrower than this before OCR
@@ -70,7 +72,8 @@ UNIT_OCR_FIXES = {"wt": "шт"}
 def normalize_unit(text: str) -> str:
     if not text:
         return text
-    return UNIT_OCR_FIXES.get(text.strip().lower(), text)
+    lowered = text.strip().lower()
+    return UNIT_OCR_FIXES.get(lowered, lowered)
 
 
 def pdf_to_images(pdf_bytes: bytes, dpi: int = PDF_RENDER_DPI) -> List[Image.Image]:
@@ -326,9 +329,85 @@ def collect_name_overflow(cells: List[str]) -> str:
     return " ".join(parts).strip()
 
 
-def parse_item_rows(rows: List[pd.DataFrame], bounds: List[float]) -> List[Dict[str, str]]:
+def find_column_divider(
+    image: Image.Image, x_start: int, x_end: int, y_start: int, y_end: int, frac: float = 0.6
+) -> Optional[int]:
+    """Find the x-position of a ruled vertical table border within [x_start, x_end): the first
+    column whose pixels are almost entirely dark across [y_start, y_end). Needed because a
+    header cell merged across sub-columns (e.g. "Количество" spanning "подлежит отпуску" and
+    "отпущено") has its own OCR'd text anchored somewhere inside that merged span rather than
+    at the sub-column's true left edge — the printed rule line is the only reliable boundary."""
+    if x_end <= x_start or y_end <= y_start:
+        return None
+    band = image.crop((x_start, y_start, x_end, y_end))
+    arr = np.asarray(band, dtype=np.int32)
+    darkness = (255 - arr).sum(axis=0)
+    threshold = 255 * (y_end - y_start) * frac
+    hits = np.where(darkness >= threshold)[0]
+    if len(hits) == 0:
+        return None
+    return x_start + int(hits[0])
+
+
+def refine_row_unit_qty(image: Image.Image, row: pd.DataFrame, bounds: List[float]):
+    """"Единица измерения" and "Количество" hold small text squeezed against ruled table
+    lines, and OCR'ing them as part of the whole page or the whole item-table crop often
+    misses them entirely — leaving that x-range empty and letting the next column's value
+    (Цена) bleed into what should be Количество. Re-OCRing each one in isolation, at its own
+    true column boundary (via find_column_divider — the header-anchor bounds aren't reliable
+    for this, see there), recovers both far more reliably. `row` must be in the same pixel
+    coordinate space as `image` (i.e. whichever image `row` was originally OCR'd from)."""
+    top = int(row["top"].min())
+    bottom = int((row["top"] + row["height"]).max())
+
+    unit_search_start = max(0, int(bounds[3]) - 5)
+    qty_end = max(unit_search_start + 1, int(bounds[5]) - 5)
+    divider = find_column_divider(image, unit_search_start + 30, qty_end, top - 3, bottom + 3)
+    if divider is None:
+        divider = max(unit_search_start + 1, int(bounds[4]) - 5)
+
+    # The "Единица" header anchor has the same merged-header imprecision as "Количество" does
+    # (see find_column_divider) one column over, so back up past it too; a margin proportional
+    # to image width holds up across scans rendered at different effective resolutions.
+    left_margin = max(20, int(image.width * 0.009))
+    unit_start = max(0, unit_search_start - left_margin)
+
+    unit = None
+    if divider > unit_start:
+        y_start, y_end = max(0, top - 8), min(image.height, bottom + 8)
+        strip = image.crop((unit_start, y_start, divider, y_end))
+        strip = strip.resize((strip.width * 3, strip.height * 3), Image.LANCZOS)
+        strip = ImageOps.autocontrast(strip)
+        words = ocr_words(strip, lang=_UNIT_COLUMN_LANG, config=_OCR_CONFIG)
+        if not words.empty:
+            # A stray digit sometimes leaks in from the neighboring nomenclature/quantity
+            # columns; a unit abbreviation is never purely numeric, so only letter-bearing
+            # tokens are genuine readings of this cell.
+            letter_tokens = [t for t in words["text"] if re.search(r"[а-яёА-ЯЁ]", str(t))]
+            if letter_tokens:
+                unit = normalize_unit(" ".join(letter_tokens))
+
+    qty = None
+    if qty_end > divider:
+        y_start, y_end = max(0, top - 3), min(image.height, bottom + 3)
+        strip = image.crop((divider, y_start, qty_end, y_end))
+        words = ocr_words(strip, lang="eng", config=_ROW_NUMBER_CONFIG)
+        if not words.empty:
+            numbers = []
+            for text in words.sort_values("left")["text"]:
+                numbers.extend(re.findall(r"\d[\d.,]*", str(text)))
+            qty = parse_number(numbers[0]) if numbers else None
+
+    return unit, qty
+
+
+def parse_item_rows(
+    rows: List[pd.DataFrame], bounds: List[float], image: Optional[Image.Image] = None
+) -> List[Dict[str, str]]:
     """Parse item rows out of `rows` (searched from the start) using pre-computed column
-    x-bounds, stopping at the "Итого" total row if present."""
+    x-bounds, stopping at the "Итого" total row if present. When `image` is given (the same
+    image `rows` was OCR'd from), unit and quantity get a second, per-row refinement pass via
+    refine_row_unit_qty — see its docstring for why that column needs special handling."""
     total_row = None
     for i, row in enumerate(rows):
         if re.search(r"Итого", row_text(row), re.IGNORECASE):
@@ -365,6 +444,13 @@ def parse_item_rows(rows: List[pd.DataFrame], bounds: List[float]) -> List[Dict[
             continue
 
         running_no += 1
+        unit = normalize_unit(cells[4])
+        if image is not None:
+            refined_unit, refined_qty = refine_row_unit_qty(image, row, bounds)
+            if refined_unit:
+                unit = refined_unit
+            if refined_qty is not None:
+                qty = refined_qty
         sum_without_vat = None
         if sum_with_vat is not None and vat_amount is not None:
             sum_without_vat = sum_with_vat - vat_amount
@@ -377,7 +463,7 @@ def parse_item_rows(rows: List[pd.DataFrame], bounds: List[float]) -> List[Dict[
             "no": str(running_no),
             "name": name,
             "nomen": cells[3],
-            "unit": normalize_unit(cells[4]),
+            "unit": unit,
             "qty": qty,
             "price_without_vat": price_without_vat,
             "sum_without_vat": sum_without_vat,
@@ -394,20 +480,6 @@ def merge_item_fields(primary: Dict[str, str], secondary: Dict[str, str]) -> Dic
         if is_blank and value not in (None, ""):
             merged[key] = value
     return merged
-
-
-def refine_unit_column(crop: Image.Image, bounds: List[float]) -> List[str]:
-    """Re-OCR just the "Единица измерения" column, in isolation, with Cyrillic-only language
-    and character whitelist (see _UNIT_COLUMN_LANG above). `crop` is already cropped to the
-    item table's y-range, x-aligned with `bounds`, so slicing it horizontally by the unit
-    column's bounds gives a tall, narrow strip with one row per item."""
-    x_start = max(0, int(bounds[3]) - 5)
-    x_end = max(x_start + 1, int(bounds[4]) - 5)
-    unit_crop = crop.crop((x_start, 0, x_end, crop.height))
-    words = ocr_words(unit_crop, lang=_UNIT_COLUMN_LANG, config=_UNIT_OCR_CONFIG)
-    if words.empty:
-        return []
-    return [row_text(row).strip() for row in cluster_rows(words)]
 
 
 def extract_items_via_crop(image: Image.Image, rows: List[pd.DataFrame]) -> List[Dict[str, str]]:
@@ -444,7 +516,7 @@ def extract_items_via_crop(image: Image.Image, rows: List[pd.DataFrame]) -> List
     plain_items = []
     plain_words = ocr_words(crop)
     if not plain_words.empty:
-        plain_items = parse_item_rows(cluster_rows(plain_words), bounds)
+        plain_items = parse_item_rows(cluster_rows(plain_words), bounds, image=crop)
 
     # Small digits sitting right against table gridlines (e.g. the qty sub-columns) can be
     # missed entirely on the plain crop — sharpening exaggerates the digit strokes enough to
@@ -456,7 +528,7 @@ def extract_items_via_crop(image: Image.Image, rows: List[pd.DataFrame]) -> List
     sharp_items = []
     sharp_words = ocr_words(sharpened)
     if not sharp_words.empty:
-        sharp_items = parse_item_rows(cluster_rows(sharp_words), bounds)
+        sharp_items = parse_item_rows(cluster_rows(sharp_words), bounds, image=sharpened)
 
     if plain_items and sharp_items and len(plain_items) == len(sharp_items):
         items = [merge_item_fields(p, s) for p, s in zip(plain_items, sharp_items)]
@@ -465,16 +537,17 @@ def extract_items_via_crop(image: Image.Image, rows: List[pd.DataFrame]) -> List
     elif sharp_items:
         items = sharp_items
     else:
-        items = parse_item_rows(rows[header_band[1]:], bounds)
+        items = []
 
-    # Only trust the dedicated Cyrillic-only pass when it found exactly one reading per item
-    # row; a count mismatch means its own row-clustering didn't line up with the item rows, so
-    # the rus+eng reading (already run through normalize_unit's known-misread fixes) stays.
-    unit_texts = refine_unit_column(crop, bounds)
-    if len(unit_texts) == len(items):
-        for item, unit_text in zip(items, unit_texts):
-            if unit_text:
-                item["unit"] = normalize_unit(unit_text)
+    # Tesseract's layout analysis on an isolated crop can, on some scans, drop entire rows of
+    # small text it reads fine as part of the whole page (its "uniform block" assumption
+    # breaks down without the rest of the page for context) — a silent failure mode distinct
+    # from the per-cell misreads the two passes above are built to correct. A lower item count
+    # than the whole-page reading is the signal that happened, so fall back to whichever found
+    # more complete rows rather than trusting the crop unconditionally.
+    whole_page_items = parse_item_rows(rows[header_band[1]:], bounds, image=image)
+    if len(whole_page_items) > len(items):
+        items = whole_page_items
 
     return items
 
