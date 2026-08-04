@@ -76,6 +76,16 @@ def normalize_unit(text: str) -> str:
     return UNIT_OCR_FIXES.get(lowered, lowered)
 
 
+def clean_nomen(text: str) -> str:
+    """A long item name or its trailing unit suffix (e.g. "...18л") occasionally overflows,
+    physically on the page, past the Наименование|Номенклатурный boundary line, and gets
+    OCR'd into this column's cell alongside the actual code. A nomenclature number is always
+    a run of 5+ digits (see nomen_has_code in parse_item_rows), so extracting just that run
+    discards whatever bled in around it."""
+    match = re.search(r"\d{5,}", text)
+    return match.group(0) if match else text
+
+
 def pdf_to_images(pdf_bytes: bytes, dpi: int = PDF_RENDER_DPI) -> List[Image.Image]:
     images = []
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -401,6 +411,37 @@ def refine_row_unit_qty(image: Image.Image, row: pd.DataFrame, bounds: List[floa
     return unit, qty
 
 
+def refine_row_sum_with_vat(image: Image.Image, row: pd.DataFrame, bounds: List[float]) -> Optional[float]:
+    """"Сумма с НДС" is squeezed against ruled lines the same way Количество is, and on some
+    scans goes entirely undetected in the whole-page/crop OCR pass, while "Цена за единицу"
+    (identical to it whenever quantity is 1) and "Сумма НДС" on either side usually are
+    detected — so callers should treat a value recovered here as the authoritative "Сумма с
+    НДС" reading and re-derive "Сумма НДС" placement accordingly rather than trusting
+    positional cell-slicing for either. Re-OCRs the column in isolation at its own
+    gridline-detected boundaries (see find_column_divider)."""
+    top = int(row["top"].min())
+    bottom = int((row["top"] + row["height"]).max())
+    y_start, y_end = top - 3, bottom + 3
+
+    price_start = max(0, int(bounds[5]) - 5)
+    search_end = min(image.width, int(bounds[7]) + int(bounds[7] - bounds[6]))
+    div1 = find_column_divider(image, price_start + 30, search_end, y_start, y_end)
+    if div1 is None:
+        return None
+    div2 = find_column_divider(image, div1 + 30, search_end, y_start, y_end)
+    if div2 is None or div2 <= div1:
+        return None
+
+    strip = image.crop((div1, max(0, y_start - 8), div2, min(image.height, y_end + 8)))
+    strip = strip.resize((strip.width * 3, strip.height * 3), Image.LANCZOS)
+    strip = ImageOps.autocontrast(strip)
+    words = ocr_words(strip, lang="eng", config=_OCR_CONFIG)
+    if words.empty:
+        return None
+    combined = "".join(str(t) for t in words.sort_values("left")["text"])
+    return parse_number(combined)
+
+
 def parse_item_rows(
     rows: List[pd.DataFrame], bounds: List[float], image: Optional[Image.Image] = None
 ) -> List[Dict[str, str]]:
@@ -451,6 +492,16 @@ def parse_item_rows(
                 unit = refined_unit
             if refined_qty is not None:
                 qty = refined_qty
+
+            refined_sum_with_vat = refine_row_sum_with_vat(image, row, bounds)
+            if refined_sum_with_vat is not None:
+                if vat_amount is None and sum_with_vat is not None:
+                    # cells[8] (vat_amount's normal slot) was empty, which — now that a genuine
+                    # "Сумма с НДС" reading exists — means what cells[7] actually held was
+                    # "Сумма НДС" that fell short of reaching its own anchor bound (bounds[7]),
+                    # not "Сумма с НДС" at all.
+                    vat_amount = sum_with_vat
+                sum_with_vat = refined_sum_with_vat
         sum_without_vat = None
         if sum_with_vat is not None and vat_amount is not None:
             sum_without_vat = sum_with_vat - vat_amount
@@ -462,7 +513,7 @@ def parse_item_rows(
         items.append({
             "no": str(running_no),
             "name": name,
-            "nomen": cells[3],
+            "nomen": clean_nomen(cells[3]),
             "unit": unit,
             "qty": qty,
             "price_without_vat": price_without_vat,

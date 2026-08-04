@@ -1,4 +1,5 @@
 import argparse
+import os
 import shutil
 import sys
 from datetime import datetime
@@ -63,9 +64,6 @@ def main():
         print(f"Could not find {args.xlsx}", file=sys.stderr)
         sys.exit(1)
 
-    backup_path = f"{args.xlsx}.{datetime.now():%Y%m%d-%H%M%S}.bak"
-    shutil.copy2(args.xlsx, backup_path)
-
     if SHEET_NAME not in wb.sheetnames:
         print(
             f"Sheet '{SHEET_NAME}' not found in {args.xlsx}. Available sheets: {', '.join(wb.sheetnames)}",
@@ -73,6 +71,20 @@ def main():
         )
         sys.exit(1)
     ws = wb[SHEET_NAME]
+
+    # Confirm the file is actually writable before creating a backup or touching anything —
+    # Excel holds an exclusive lock while the workbook is open, and without this check that
+    # left a backup behind even on a run that never inserted anything.
+    try:
+        with open(args.xlsx, "r+b"):
+            pass
+    except PermissionError:
+        print(f"Could not save {args.xlsx} — is it open in Excel? Close it and try again.", file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs("backup", exist_ok=True)
+    backup_path = f"backup/{os.path.basename(args.xlsx)}.{datetime.now():%Y%m%d-%H%M%S}.bak"
+    shutil.copy2(args.xlsx, backup_path)
 
     start_row = find_next_empty_row(ws)
     row = start_row
