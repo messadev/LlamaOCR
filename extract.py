@@ -62,6 +62,16 @@ BLOCK_LABEL_ANCHORS = ["отправитель", "получатель", "Отв
 IIN_BIN_LABEL_RE = re.compile(r"ИИН|БИН", re.IGNORECASE)
 IIN_BIN_NUMBER_RE = re.compile(r"\d{9,14}")
 
+# "Итого" (the table total) plus phrases from the footer/signature block below it ("Всего
+# отпущено...", "Уполномоченное лицо Поставщика...", "Главный бухгалтер..."). Used to (1) bound
+# the item table's bottom, and (2) reject any row dominated by this text from being misparsed as
+# a line item — including "Итого" itself, since whole-page vs. cropped-and-resized re-OCR passes
+# can read it differently and one pass finding it cleanly doesn't guarantee the other did too.
+FOOTER_MARKERS_RE = re.compile(
+    r"Итого|Всего отпущено|Уполномоченное лицо|Главный бухгалтер|Отпуск.{0,10}разрешил|расшифровка",
+    re.IGNORECASE,
+)
+
 # Tesseract's rus+eng model occasionally reads the short, all-caps unit abbreviation "ШТ"
 # (pieces) as the similarly-shaped Latin "WT" instead of committing to the Cyrillic script.
 # The unit column only ever holds a handful of short abbreviations, so known misreads are
@@ -105,15 +115,40 @@ def load_images(path: str) -> List[Image.Image]:
     return [Image.open(path).convert("RGB")]
 
 
-def correct_orientation(image: Image.Image) -> Image.Image:
+def _osd_rotate(image: Image.Image) -> int:
     try:
         osd = pytesseract.image_to_osd(image, config=_TESSDATA_ARG, output_type=Output.DICT)
     except pytesseract.TesseractError:
-        return image
-    rotate = osd.get("rotate", 0)
-    if rotate:
-        image = image.rotate(-rotate, expand=True)
-    return image
+        return 0
+    return osd.get("rotate", 0) or 0
+
+
+def orient_for_ocr(image: Image.Image):
+    """Pick whichever page rotation actually lets the item-table header be located, instead of
+    trusting Tesseract's OSD blindly. OSD's own orientation_conf on this document type has been
+    observed running single digits to low 20s even when its rotate guess happens to be right, so
+    it's too unreliable a signal to apply unconditionally — a wrong guess here would silently
+    degrade every downstream step (header-anchor matching, column bounds, row clustering).
+    Tries OSD's guess first (cheap, usually correct), then falls back to the other three
+    rotations if the header can't be found. Returns (image, words, rows) for whichever rotation
+    worked, or the OSD guess with whatever it found if none locate a header."""
+    osd_rotate = _osd_rotate(image)
+    candidates = [osd_rotate] + [r for r in (0, 90, 180, 270) if r != osd_rotate]
+    fallback = None
+    for rotate in candidates:
+        candidate_image = image.rotate(-rotate, expand=True) if rotate else image
+        words = ocr_words(candidate_image)
+        if words.empty:
+            if fallback is None:
+                fallback = (candidate_image, words, [])
+            continue
+        rows = cluster_rows(words)
+        header_band, _bounds = locate_item_table(rows)
+        if header_band is not None:
+            return candidate_image, words, rows
+        if fallback is None:
+            fallback = (candidate_image, words, rows)
+    return fallback if fallback is not None else (image, ocr_words(image), [])
 
 
 def preprocess(image: Image.Image) -> Image.Image:
@@ -121,12 +156,18 @@ def preprocess(image: Image.Image) -> Image.Image:
     if image.width < MIN_OCR_WIDTH:
         scale = MIN_OCR_WIDTH / image.width
         image = image.resize((int(image.width * scale), int(image.height * scale)), Image.LANCZOS)
-    image = ImageOps.autocontrast(image)
-    return correct_orientation(image)
+    return ImageOps.autocontrast(image)
 
 
 def ocr_words(image: Image.Image, lang: str = _OCR_LANG, config: str = _OCR_CONFIG) -> pd.DataFrame:
-    data = pytesseract.image_to_data(image, lang=lang, config=config, output_type=Output.DATAFRAME)
+    # Output.DATAFRAME routes Tesseract's raw TSV through pandas.read_csv, which infers one
+    # dtype per column from all rows at once — a crop containing only digit tokens (exactly what
+    # the per-cell numeric refinement passes below deliberately isolate) gets its entire "text"
+    # column silently coerced to float64, turning "00406" into 406 or "45"/"910.00" into
+    # "45.0"/"910.0" that then concatenate into garbage numbers downstream. Output.DICT parses
+    # each field independently instead, so "text" keeps its original string form.
+    raw = pytesseract.image_to_data(image, lang=lang, config=config, output_type=Output.DICT)
+    data = pd.DataFrame(raw)
     data = data.dropna(subset=["text"]).copy()
     data["text"] = data["text"].astype(str).str.strip()
     data = data[data["text"] != ""]
@@ -438,7 +479,15 @@ def refine_row_sum_with_vat(image: Image.Image, row: pd.DataFrame, bounds: List[
     words = ocr_words(strip, lang="eng", config=_OCR_CONFIG)
     if words.empty:
         return None
-    combined = "".join(str(t) for t in words.sort_values("left")["text"])
+    # This crop is a single number and nothing else, so any token that isn't purely digits/
+    # punctuation is noise (observed: a faint second "ghost" line of garbage text OCR'd inside
+    # the same strip, interleaving by x-position with the real digits and splitting the number
+    # mid-run, e.g. "15" + "AN" + "200,00" instead of "15" + "200,00"). Dropping non-numeric
+    # tokens before concatenating keeps the real digit run intact.
+    numeric_tokens = words[words["text"].str.fullmatch(r"[\d.,]+")]
+    if numeric_tokens.empty:
+        return None
+    combined = "".join(str(t) for t in numeric_tokens.sort_values("left")["text"])
     return parse_number(combined)
 
 
@@ -451,7 +500,7 @@ def parse_item_rows(
     refine_row_unit_qty — see its docstring for why that column needs special handling."""
     total_row = None
     for i, row in enumerate(rows):
-        if re.search(r"Итого", row_text(row), re.IGNORECASE):
+        if FOOTER_MARKERS_RE.search(row_text(row)):
             total_row = i
             break
     end = total_row if total_row is not None else len(rows)
@@ -460,6 +509,12 @@ def parse_item_rows(
     running_no = 0
     pending_name_lines: List[str] = []
     for i, row in enumerate(rows[:end]):
+        if FOOTER_MARKERS_RE.search(row_text(row)):
+            # Defense in depth: the table-bottom boundary above should already exclude this row,
+            # but if it slipped through (e.g. total_row was found later via "Итого" while a
+            # footer line got interleaved earlier by row-clustering), never let it be scored as
+            # a possible item row.
+            continue
         cells = slice_by_columns(row, bounds)
         # cells: [lead(unused), no, name, nomen, unit, qty, price, sum_vat, vat_amount]
         nomen_has_code = bool(re.search(r"\d{5,}", cells[3]))
@@ -488,6 +543,14 @@ def parse_item_rows(
         unit = normalize_unit(cells[4])
         if image is not None:
             refined_unit, refined_qty = refine_row_unit_qty(image, row, bounds)
+            if refined_unit and FOOTER_MARKERS_RE.search(refined_unit):
+                # The unit-column refinement re-OCRs at 3x zoom with autocontrast, and can read
+                # "Итого"/footer text cleanly even when the whole-page pass read it as unrecog-
+                # nizable noise (the case the boundary checks above rely on) — so this is the
+                # last chance to catch a total/footer row that slipped through as a fake item.
+                # A real item's "Единица измерения" is never one of these markers.
+                running_no -= 1
+                continue
             if refined_unit:
                 unit = refined_unit
             if refined_qty is not None:
@@ -495,6 +558,26 @@ def parse_item_rows(
 
             refined_sum_with_vat = refine_row_sum_with_vat(image, row, bounds)
             if refined_sum_with_vat is not None:
+                expected = price * qty if (price is not None and qty) else None
+                if (
+                    expected is not None
+                    and sum_with_vat is not None
+                    and abs(sum_with_vat - expected) <= abs(refined_sum_with_vat - expected)
+                ):
+                    # The refined reading's gridline-divider detection can lock onto the wrong
+                    # pair of columns (e.g. "Цена" instead of "Сумма с НДС") and return a
+                    # plausible-looking but wrong number. Количество × Цена is the table's own
+                    # arithmetic ground truth when both are available, so use it to prefer
+                    # whichever candidate — refined or the original positional reading — is
+                    # actually consistent, instead of always trusting the refined one blindly.
+                    refined_sum_with_vat = sum_with_vat
+                if vat_amount is not None and vat_amount > refined_sum_with_vat:
+                    # A VAT amount can never exceed the tax-inclusive total it's drawn from, so
+                    # cells[8]'s positional reading was wrong (it likely picked up stray digits
+                    # from beyond the table's right edge, which this column's slice is unbounded
+                    # against — see slice_by_columns). Treat it as unread rather than let a
+                    # bogus, too-large value flip sum_without_vat negative below.
+                    vat_amount = None
                 if vat_amount is None and sum_with_vat is not None:
                     # cells[8] (vat_amount's normal slot) was empty, which — now that a genuine
                     # "Сумма с НДС" reading exists — means what cells[7] actually held was
@@ -546,7 +629,7 @@ def extract_items_via_crop(image: Image.Image, rows: List[pd.DataFrame]) -> List
     header_bottom = int(max((r["top"] + r["height"]).max() for r in rows[header_band[0]:header_band[1]]))
     total_bottom = None
     for row in rows[header_band[1]:]:
-        if re.search(r"Итого", row_text(row), re.IGNORECASE):
+        if FOOTER_MARKERS_RE.search(row_text(row)):
             total_bottom = int((row["top"] + row["height"]).max())
             break
     if total_bottom is None:
@@ -660,11 +743,10 @@ def extract_document(path: str) -> List[Dict[str, str]]:
     iin_bin = ""
 
     for image in images:
-        proc_image = preprocess(image)
-        words = ocr_words(proc_image)
+        base_image = preprocess(image)
+        proc_image, words, rows = orient_for_ocr(base_image)
         if words.empty:
             continue
-        rows = cluster_rows(words)
 
         if header_block is None:
             hb = extract_header_block(rows)
